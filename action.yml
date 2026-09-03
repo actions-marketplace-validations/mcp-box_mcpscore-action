@@ -11,7 +11,7 @@ inputs:
     description: "MCP server to audit — a URL (Streamable HTTP / SSE) or a local .py/.js server path."
     required: true
   version:
-    description: "mcpscore version to run (e.g. 0.8.0). Empty = latest."
+    description: "mcpscore version to run (e.g. 1.9.0). Empty = latest."
     required: false
     default: ""
   min-score:
@@ -69,7 +69,7 @@ runs:
   using: composite
   steps:
     - name: Install uv
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
     - name: Audit with mcpscore
       id: audit
       shell: bash
