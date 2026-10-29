@@ -22,6 +22,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+SARIF_MIN_VERSION = "1.14.0"
+"""First mcpscore release with ``--sarif``; an older engine rejects the flag as a usage error (exit 1)."""
+
 COMMENT_MARKER = "<!-- mcpscore-action -->"
 """Hidden marker that lets the action find and update its own PR comment."""
 
@@ -31,19 +34,46 @@ def env(name: str, default: str = "") -> str:
     return os.environ.get(f"INPUT_{name.upper().replace('-', '_')}", default).strip()
 
 
-def run_audit(target: str, version: str, extra_args: list[str]) -> tuple[int, str, str]:
-    """Run ``uvx mcpscore[@version] <target> --json`` and capture its output.
+# Inputs this action adds to its own step environment that the audited server
+# must never see. A local target is code from the pull request under review,
+# and mcpscore launches it as a child process that inherits the environment;
+# the comment token would otherwise be readable by that code.
+SECRET_INPUTS = frozenset({"INPUT_GITHUB_TOKEN"})
+
+
+def audit_env() -> dict[str, str]:
+    """The environment for the mcpscore subprocess: the step's, minus this action's own secrets."""
+    return {name: value for name, value in os.environ.items() if name not in SECRET_INPUTS}
+
+
+def run_audit(target: str, version: str, extra_args: list[str], sarif_path: str = "") -> tuple[int, str, str]:
+    """Run ``uvx mcpscore[@version] <target> --json [--sarif <path>]`` and capture its output.
 
     Returns:
         (exit_code, stdout, stderr). mcpscore writes the JSON report to stdout
         and logs to stderr; a non-zero exit means it could not audit (e.g.
-        connection failure, exit code 2).
+        connection failure, exit code 2). With ``sarif_path``, the CLI writes
+        the SARIF file itself, before its gates run.
 
     """
     spec = f"mcpscore@{version}" if version else "mcpscore"
-    cmd = ["uvx", spec, target, "--json", *extra_args]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    # Bound as one token: a path that begins with `-` would otherwise be read
+    # as another option instead of as the value.
+    cmd = ["uvx", spec, target, "--json", *([f"--sarif={sarif_path}"] if sarif_path else []), *extra_args]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=audit_env())
     return result.returncode, result.stdout, result.stderr
+
+
+def _names_sarif_option(arg: str) -> bool:
+    """Whether a CLI argument is ``--sarif``, ``--sarif=…``, or an unambiguous abbreviation argparse accepts.
+
+    argparse matches option prefixes, so ``--sa=x`` already sets ``--sarif``:
+    no other mcpscore option begins with ``--sa`` (``--stdio`` and ``--smoke``
+    make ``--s`` ambiguous, and the CLI rejects that itself). Anything from
+    ``--sa`` up is an alias for this purpose.
+    """
+    name = arg.split("=", 1)[0]
+    return len(name) >= len("--sa") and "--sarif".startswith(name)
 
 
 def percentage(score: int, max_score: int) -> int:
@@ -57,15 +87,24 @@ def evaluate_gate(report: dict, min_score: str, min_readiness: str) -> list[str]
     """Return the reasons the audit fails the configured thresholds (empty = pass).
 
     Thresholds are integer percentages passed as strings; an empty string
-    disables that gate. The readiness axis is only gated when the server was
-    actually assessed for readiness (``readiness.max_score > 0``).
+    disables that gate. A partial audit always fails ``min-score``, as it fails
+    the CLI's ``--fail-under``: its score covers only the observable surface.
+    The readiness axis is only gated when the server was actually assessed for
+    readiness (``readiness.max_score > 0``).
     """
     failures: list[str] = []
 
     main_pct = percentage(report["score"], report["max_score"])
     if min_score:
         threshold = int(min_score)
-        if main_pct < threshold:
+        if report.get("partial"):
+            reason = report.get("partial_reason")
+            failures.append(
+                f"min-score {threshold}: this was a partial audit; its score covers only the observable "
+                f"surface and cannot demonstrate the threshold.{f' {reason}' if reason else ''} "
+                "In this action, the credential goes in MCPSCORE_TOKEN or a header in `args`."
+            )
+        elif main_pct < threshold:
             failures.append(
                 f"score {report['score']}/{report['max_score']} ({main_pct}%) is below the required {threshold}%"
             )
@@ -95,12 +134,71 @@ def _severity_table(report: dict) -> str:
     return "\n".join([header, divider, passed, failed])
 
 
+def _plain_markdown(value: str) -> str:
+    """Render report text literally without active Markdown, HTML or mentions."""
+    text = " ".join(value.split())
+    delimiter = "`"
+    while delimiter in text:
+        delimiter += "`"
+    return delimiter + " " + text + " " + delimiter
+
+
 def _failed_rules_section(report: dict) -> str:
-    failed = [r for r in report["results"] if not r["passed"]]
+    failed = [(r, False) for r in report["results"] if not r["passed"]]
+    readiness = report.get("readiness") or {}
+    failed.extend((r, True) for r in readiness.get("results", []) if not r["passed"])
     if not failed:
         return "All checks passed. 🎉"
-    items = "\n".join(f"- `{r['rule_id']}` ({r['severity']})" for r in failed)
-    return f"<details><summary>{len(failed)} failed check(s)</summary>\n\n{items}\n\n</details>"
+    items = []
+    for result, is_readiness in failed:
+        label = ""
+        if is_readiness:
+            label = " — readiness, " + ("counted in score" if readiness.get("counted_in_main") else "informative")
+        item = f"- `{result['rule_id']}` ({result['severity']}){label}"
+        message = result.get("message")
+        if isinstance(message, str) and message.strip():
+            item += "\n  " + _plain_markdown(message)
+        hint = result.get("suggested_fix")
+        if isinstance(hint, str) and hint.strip():
+            item += "\n  **Fix:** " + _plain_markdown(hint)
+        items.append(item)
+    readiness_failed = sum(is_readiness for _, is_readiness in failed)
+    main_failed = len(failed) - readiness_failed
+    summary = f"{main_failed} failed check(s)"
+    if readiness_failed:
+        summary = (f"{main_failed} main check(s) failed; " if main_failed else "") + (
+            f"{readiness_failed} readiness check(s) failed"
+        )
+    return f"<details><summary>{summary}</summary>\n\n" + "\n".join(items) + "\n\n</details>"
+
+
+def _config_lines(report: dict) -> list[str]:
+    """Markdown lines describing an applied ``mcpscore.toml`` (the report's ``config`` block), or none.
+
+    A configured score is the score under the repository's own policy; the
+    comment says so, and which rules the gate tripped on, so nobody reads the
+    number as the canonical one the badge shows.
+    """
+    block = report.get("config")
+    if not block:
+        return []
+    off, reranked = len(block.get("disabled", [])), len(block.get("reranked", {}))
+    parts = [f"{off} rule{'s' if off != 1 else ''} off"] if off else []
+    if reranked:
+        parts.append(f"{reranked} re-ranked")
+    # The report is another program's output; read the gate defensively so a
+    # partial block degrades to a vaguer line rather than a crashed comment.
+    gate = block.get("gate") or {}
+    fail_on = gate.get("fail_on", "?")
+    if gate:
+        parts.append(f"gate at {fail_on}")
+    lines = [f"**Config:** `{block.get('source', 'mcpscore.toml')}` — {', '.join(parts) if parts else 'no overrides'}"]
+    failed_ids = gate.get("failed") or []
+    if failed_ids:
+        failed = ", ".join(f"`{rule_id}`" for rule_id in failed_ids)
+        lines.append(f"**Gate failed:** {len(failed_ids)} rule(s) at or above {fail_on}: {failed}")
+    lines.append("")
+    return lines
 
 
 def build_report_markdown(report: dict) -> str:
@@ -117,6 +215,7 @@ def build_report_markdown(report: dict) -> str:
         f"**Target:** `{report.get('target', '?')}`  ·  "
         f"**Spec:** {spec.get('negotiated_version', 'unknown')} ({spec.get('era', 'unknown')})",
         "",
+        *_config_lines(report),
         _severity_table(report),
         "",
     ]
@@ -124,10 +223,17 @@ def build_report_markdown(report: dict) -> str:
     readiness_max = readiness.get("max_score", 0)
     if readiness_max > 0:
         readiness_pct = percentage(readiness.get("score", 0), readiness_max)
+        # Since mcpscore 1.1.0 a server on the modern lifecycle has these points
+        # counted in score/max_score; the report says which (older engines
+        # never counted them, so a missing key reads as not counted).
+        counted = (
+            "counted in the main score"
+            if readiness.get("counted_in_main")
+            else "informative, not counted in the main score"
+        )
         lines.append(
             f"**Readiness for MCP {spec.get('readiness_target', '')}:** "
-            f"{readiness.get('score', 0)}/{readiness_max} ({readiness_pct}%) "
-            f"— informative, not part of the main score."
+            f"{readiness.get('score', 0)}/{readiness_max} ({readiness_pct}%) — {counted}."
         )
         lines.append("")
 
@@ -138,6 +244,28 @@ def build_report_markdown(report: dict) -> str:
         f"[docs](https://docs.mcpscore.dev) · [methodology](https://docs.mcpscore.dev/methodology)</sub>"
     )
     return "\n".join(lines)
+
+
+# Exit codes that mean the audit completed and a gate the CLI itself enforces
+# failed: 3 for --fail-under / --fail-under-readiness / a configured [gate],
+# 4 for a --smoke check. The report is still on stdout and must still be
+# published; the job fails afterwards with the reason.
+CLI_GATE_EXIT_CODES = (3, 4)
+
+
+def cli_gate_failures(report: dict, code: int) -> list[str]:
+    """Explain a CLI gate exit (3 or 4) from the report, so the job's error names the rules."""
+    if code == 3:
+        gate = (report.get("config") or {}).get("gate") or {}
+        failed_ids = gate.get("failed") or []
+        if failed_ids:
+            return [f"mcpscore [gate] fail_on = {gate.get('fail_on', '?')}: failed rule(s) {', '.join(failed_ids)}"]
+        return ["mcpscore exited 3: a --fail-under gate passed through `args` was not met"]
+    if code == 4:
+        checks = (report.get("smoke") or {}).get("checks") or []
+        failed = [c.get("check_id", "?") for c in checks if c.get("verdict") == "fail"]
+        return [f"mcpscore --smoke: failed check(s) {', '.join(failed) if failed else '(see the report)'}"]
+    return []
 
 
 def build_comment(report: dict) -> str:
@@ -241,10 +369,43 @@ def main() -> int:
 
     version = env("version")
     extra_args = env("args").split()
-    code, stdout, stderr = run_audit(target, version, extra_args)
+    sarif_path = env("sarif-path")
+    if sarif_path == "-":
+        # stdout carries the JSON report this action parses; the CLI refuses
+        # the combination too, but the message here names the input.
+        print("::error::'sarif-path' must be a file path, not '-' (stdout carries the JSON report)")
+        return 1
+    if sarif_path and any(_names_sarif_option(arg) for arg in extra_args):
+        # argparse keeps the last occurrence, so a `--sarif` in `args` would
+        # silently redirect the file away from the path the upload step reads.
+        print("::error::'sarif-path' and a `--sarif` in `args` name two files; keep one (prefer the input)")
+        return 1
+    report_path = Path(env("report-path", "mcpscore-report.json"))
+    if sarif_path and Path(sarif_path).resolve() == report_path.resolve():
+        # The CLI writes the SARIF first and this action writes the JSON report
+        # after; one path for both would leave plain JSON where the upload looks.
+        print("::error::'sarif-path' and 'report-path' name the same file; give the SARIF its own path")
+        return 1
+    if sarif_path:
+        # The CLI writes the file only after an audit completes. Without this,
+        # a connection failure would leave an earlier step's file in place and
+        # an upload guarded by hashFiles() would ship stale findings as new.
+        try:
+            Path(sarif_path).unlink(missing_ok=True)
+        except OSError as e:
+            print(f"::error::'sarif-path' {sarif_path} cannot be replaced: {e}")
+            return 1
+    code, stdout, stderr = run_audit(target, version, extra_args, sarif_path)
 
-    if code != 0 or not stdout.strip():
+    if not stdout.strip() or (code != 0 and code not in CLI_GATE_EXIT_CODES):
         print(f"::error::mcpscore could not audit {target} (exit {code})")
+        # Only the token this action injected: a stray `--sariffoo` in `args`
+        # is the CLI's own usage error, not a version problem.
+        if sarif_path and f"unrecognized arguments: --sarif={sarif_path}" in stderr:
+            print(
+                f"::error::'sarif-path' needs mcpscore {SARIF_MIN_VERSION} or later; "
+                "set `version` to it or leave it empty"
+            )
         sys.stderr.write(stderr)
         return 1
 
@@ -255,7 +416,6 @@ def main() -> int:
         sys.stderr.write(stdout)
         return 1
 
-    report_path = Path(env("report-path", "mcpscore-report.json"))
     report_path.write_text(stdout, encoding="utf-8")
     set_outputs(report)
     write_job_summary(report)
@@ -266,7 +426,7 @@ def main() -> int:
     pct = percentage(report["score"], report["max_score"])
     print(f"mcpscore: {report['score']}/{report['max_score']} ({pct}%), era {report.get('spec', {}).get('era')}")
 
-    failures = evaluate_gate(report, env("min-score"), env("min-readiness"))
+    failures = evaluate_gate(report, env("min-score"), env("min-readiness")) + cli_gate_failures(report, code)
     for reason in failures:
         print(f"::error::{reason}")
     return 1 if failures else 0

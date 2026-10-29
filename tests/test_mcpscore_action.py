@@ -75,6 +75,32 @@ class TestEvaluateGate:
         # A stdio server gets readiness max_score 0 — the gate must not fire.
         assert action.evaluate_gate(make_report(readiness=0, readiness_max=0), "", "50") == []
 
+    def test_partial_audit_fails_min_score_even_above_threshold(self):
+        reason = "Server requires authentication (HTTP 401); scored the unauthenticated surface only."
+        failures = action.evaluate_gate(make_report(24, 27) | {"partial": True, "partial_reason": reason}, "80", "")
+        assert failures == [
+            "min-score 80: this was a partial audit; its score covers only the observable surface and cannot "
+            f"demonstrate the threshold. {reason} In this action, the credential goes in MCPSCORE_TOKEN or a "
+            "header in `args`."
+        ]
+
+    def test_partial_audit_without_reason_still_fails_min_score(self):
+        failures = action.evaluate_gate(make_report(24, 27) | {"partial": True}, "80", "")
+        assert len(failures) == 1
+        assert "demonstrate the threshold. In this action, the credential" in failures[0]
+
+    def test_partial_audit_without_min_score_passes(self):
+        assert action.evaluate_gate(make_report(24, 27) | {"partial": True}, "", "") == []
+
+    def test_partial_audit_keeps_the_readiness_gate(self):
+        report = make_report(readiness=2, readiness_max=13) | {"partial": True}
+        failures = action.evaluate_gate(report, "", "50")
+        assert len(failures) == 1
+        assert failures[0].startswith("readiness 2/13")
+
+    def test_full_audit_is_judged_on_its_score(self):
+        assert action.evaluate_gate(make_report(88, 97) | {"partial": False}, "80", "") == []
+
     def test_both_gates_can_fail_together(self):
         failures = action.evaluate_gate(make_report(50, 97, readiness=1, readiness_max=13), "80", "50")
         assert len(failures) == 2
@@ -91,6 +117,20 @@ class TestMarkdown:
         md = action.build_report_markdown(make_report(readiness=3, readiness_max=13))
         assert "Readiness for MCP 2026-07-28" in md
         assert "3/13" in md
+
+    def test_readiness_line_says_counted_for_a_modern_lifecycle_server(self):
+        report = make_report(readiness=3, readiness_max=13)
+        report["readiness"]["counted_in_main"] = True
+        md = action.build_report_markdown(report)
+        assert "3/13 (23%) — counted in the main score." in md
+
+    def test_readiness_line_says_informative_when_not_counted(self):
+        report = make_report(readiness=3, readiness_max=13)
+        report["readiness"]["counted_in_main"] = False
+        assert "informative, not counted in the main score." in action.build_report_markdown(report)
+        # An engine older than the key never counted readiness: same wording.
+        report["readiness"].pop("counted_in_main")
+        assert "informative, not counted in the main score." in action.build_report_markdown(report)
 
     def test_readiness_line_absent_when_not_assessed(self):
         md = action.build_report_markdown(make_report(readiness=0, readiness_max=0))
@@ -159,3 +199,445 @@ class TestEnv:
     def test_default_when_unset(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("INPUT_COMMENT", raising=False)
         assert action.env("comment", "true") == "true"
+
+
+def make_configured_report(gate_failed: list[str] | None = None) -> dict:
+    report = make_report()
+    report["config"] = {
+        "source": "mcpscore.toml",
+        "sha256": "abc",
+        "disabled": ["server_websiteurl_present", "server_icons_present"],
+        "reranked": {"server_title_present": {"from": "MEDIUM", "to": "CRITICAL"}},
+        "unknown": [],
+    }
+    if gate_failed is not None:
+        report["config"]["gate"] = {"fail_on": "CRITICAL", "failed": gate_failed}
+    return report
+
+
+class TestConfiguredRuns:
+    def test_markdown_names_the_config_and_what_it_changed(self):
+        body = action.build_report_markdown(make_configured_report())
+
+        assert "**Config:** `mcpscore.toml` — 2 rules off, 1 re-ranked" in body
+        assert "Gate failed" not in body
+
+    def test_markdown_lists_the_rules_that_tripped_the_gate(self):
+        body = action.build_report_markdown(make_configured_report(gate_failed=["server_title_present"]))
+
+        assert "gate at CRITICAL" in body
+        assert "**Gate failed:** 1 rule(s) at or above CRITICAL: `server_title_present`" in body
+
+    def test_markdown_without_config_is_unchanged(self):
+        assert "Config:" not in action.build_report_markdown(make_report())
+
+    def test_cli_gate_exit_3_is_explained_from_the_config_block(self):
+        report = make_configured_report(gate_failed=["a", "b"])
+
+        assert action.cli_gate_failures(report, 3) == ["mcpscore [gate] fail_on = CRITICAL: failed rule(s) a, b"]
+
+    def test_cli_gate_exit_3_without_a_config_gate_blames_args(self):
+        assert action.cli_gate_failures(make_report(), 3) == [
+            "mcpscore exited 3: a --fail-under gate passed through `args` was not met"
+        ]
+
+    def test_cli_gate_exit_4_lists_failed_smoke_checks(self):
+        report = make_report()
+        report["smoke"] = {
+            "checks": [{"check_id": "smoke_unknown_tool", "verdict": "fail"}, {"check_id": "x", "verdict": "pass"}]
+        }
+
+        assert action.cli_gate_failures(report, 4) == ["mcpscore --smoke: failed check(s) smoke_unknown_tool"]
+
+    def test_clean_exit_has_no_cli_gate_failures(self):
+        assert action.cli_gate_failures(make_report(), 0) == []
+
+
+class TestMainWithCliGates:
+    """A CLI gate exit still publishes the report, then fails the job with the reason."""
+
+    FAKE_TOKEN = "not-a-real-token"  # noqa: S105 — a test fixture value, not a credential
+
+    def _run(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int, stdout: str
+    ) -> tuple[int, list[str], bool]:
+        printed: list[str] = []
+        commented = {"called": False}
+        # The environment a real pull_request run has: the event payload with the
+        # PR number, and the token action.yml defaults to github.token.
+        event_path = tmp_path / "event.json"
+        event_path.write_text(json.dumps({"pull_request": {"number": 7}}), encoding="utf-8")
+        monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+        monkeypatch.setenv("GITHUB_REPOSITORY", "mcp-box/example")
+        monkeypatch.setenv("INPUT_GITHUB_TOKEN", self.FAKE_TOKEN)
+        monkeypatch.setenv("INPUT_TARGET", "https://server.example/mcp")
+        monkeypatch.setenv("INPUT_REPORT_PATH", str(tmp_path / "report.json"))
+        monkeypatch.setenv("INPUT_COMMENT", "true")
+        monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        monkeypatch.setattr(action, "run_audit", lambda *a: (code, stdout, ""))
+
+        def fake_comment(report: dict, token: str) -> None:
+            # Only the network call is stubbed; the arguments are the real ones.
+            assert token == self.FAKE_TOKEN
+            assert action._pr_number() == 7
+            commented["called"] = True
+
+        monkeypatch.setattr(action, "post_or_update_comment", fake_comment)
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+        return action.main(), printed, commented["called"]
+
+    def test_config_gate_failure_publishes_the_report_and_fails_with_the_rules(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        report = make_configured_report(gate_failed=["server_title_present"])
+
+        code, printed, commented = self._run(monkeypatch, tmp_path, 3, json.dumps(report))
+
+        assert code == 1
+        assert (tmp_path / "report.json").exists()
+        assert commented is True
+        assert any(
+            "::error::mcpscore [gate] fail_on = CRITICAL: failed rule(s) server_title_present" in p for p in printed
+        )
+
+    def test_a_real_failure_still_reports_could_not_audit(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        code, printed, commented = self._run(monkeypatch, tmp_path, 2, "")
+
+        assert code == 1
+        assert commented is False
+        assert any("could not audit" in p for p in printed)
+
+
+class TestSarifPath:
+    """`sarif-path` passes `--sarif <path>` to the CLI, which writes the file itself."""
+
+    def _cmd(self, monkeypatch: pytest.MonkeyPatch, **kwargs) -> list[str]:
+        seen: dict[str, list[str]] = {}
+
+        def fake_run(cmd, **_):
+            seen["cmd"] = cmd
+
+            class Result:
+                returncode, stdout, stderr = 0, "{}", ""
+
+            return Result()
+
+        monkeypatch.setattr(action.subprocess, "run", fake_run)
+        action.run_audit("https://server.example/mcp", "", ["--smoke"], **kwargs)
+        return seen["cmd"]
+
+    def test_sarif_flag_precedes_the_extra_args(self, monkeypatch: pytest.MonkeyPatch):
+        assert self._cmd(monkeypatch, sarif_path="out.sarif") == [
+            "uvx",
+            "mcpscore",
+            "https://server.example/mcp",
+            "--json",
+            "--sarif=out.sarif",
+            "--smoke",
+        ]
+
+    def test_a_path_beginning_with_a_hyphen_is_bound_to_the_flag(self, monkeypatch: pytest.MonkeyPatch):
+        # As a separate token, `-findings.sarif` would be parsed as an option.
+        assert "--sarif=-findings.sarif" in self._cmd(monkeypatch, sarif_path="-findings.sarif")
+
+    def test_no_sarif_flag_by_default(self, monkeypatch: pytest.MonkeyPatch):
+        assert "--sarif" not in self._cmd(monkeypatch)
+
+    def test_main_passes_the_input_through(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        calls: list[tuple] = []
+        monkeypatch.setenv("INPUT_TARGET", "https://server.example/mcp")
+        monkeypatch.setenv("INPUT_SARIF_PATH", "findings.sarif")
+        monkeypatch.setenv("INPUT_REPORT_PATH", str(tmp_path / "report.json"))
+        monkeypatch.setenv("INPUT_COMMENT", "false")
+        monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+        def fake_run_audit(*args):
+            calls.append(args)
+            return 0, json.dumps(make_report()), ""
+
+        monkeypatch.setattr(action, "run_audit", fake_run_audit)
+        assert action.main() == 0
+        assert calls == [("https://server.example/mcp", "", [], "findings.sarif")]
+
+    def test_stdout_is_refused_as_a_sarif_path(self, monkeypatch: pytest.MonkeyPatch):
+        printed: list[str] = []
+        monkeypatch.setenv("INPUT_TARGET", "https://server.example/mcp")
+        monkeypatch.setenv("INPUT_SARIF_PATH", "-")
+        monkeypatch.setattr(action, "run_audit", lambda *a: pytest.fail("the CLI must not run"))
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+        assert action.main() == 1
+        assert any("'sarif-path' must be a file path" in p for p in printed)
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            "--sarif other.sarif",
+            "--sarif=other.sarif",
+            "--smoke --sarif=x.sarif",
+            "--sari=x.sarif",
+            "--sar x.sarif",
+            "--sa=x.sarif",  # the shortest prefix argparse resolves to --sarif
+        ],
+    )
+    def test_a_sarif_flag_in_args_cannot_override_the_input(self, monkeypatch: pytest.MonkeyPatch, args: str):
+        # argparse keeps the last --sarif, so the file would land somewhere the upload step does not look.
+        printed: list[str] = []
+        monkeypatch.setenv("INPUT_TARGET", "https://server.example/mcp")
+        monkeypatch.setenv("INPUT_SARIF_PATH", "findings.sarif")
+        monkeypatch.setenv("INPUT_ARGS", args)
+        monkeypatch.setattr(action, "run_audit", lambda *a: pytest.fail("the CLI must not run"))
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+        assert action.main() == 1
+        assert any("name two files" in p for p in printed)
+
+    def test_a_sarif_flag_in_args_alone_still_passes_through(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # Without the input, `args: --sarif=x.sarif` keeps working as before.
+        calls: list[tuple] = []
+        monkeypatch.setenv("INPUT_TARGET", "https://server.example/mcp")
+        monkeypatch.setenv("INPUT_ARGS", "--sarif=x.sarif")
+        monkeypatch.setenv("INPUT_REPORT_PATH", str(tmp_path / "report.json"))
+        monkeypatch.setenv("INPUT_COMMENT", "false")
+        monkeypatch.delenv("INPUT_SARIF_PATH", raising=False)
+        monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+        def fake_run_audit(*args):
+            calls.append(args)
+            return 0, json.dumps(make_report()), ""
+
+        monkeypatch.setattr(action, "run_audit", fake_run_audit)
+        assert action.main() == 0
+        assert calls == [("https://server.example/mcp", "", ["--sarif=x.sarif"], "")]
+
+    @pytest.mark.parametrize("alias", ["out/report.json", "./out/report.json", "out/../out/report.json"])
+    def test_sarif_path_may_not_alias_report_path(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, alias: str):
+        # The JSON report is written after the SARIF; one path for both leaves plain JSON for the upload.
+        printed: list[str] = []
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("INPUT_TARGET", "https://server.example/mcp")
+        monkeypatch.setenv("INPUT_REPORT_PATH", "out/report.json")
+        monkeypatch.setenv("INPUT_SARIF_PATH", alias)
+        monkeypatch.setattr(action, "run_audit", lambda *a: pytest.fail("the CLI must not run"))
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+        assert action.main() == 1
+        assert any("name the same file" in p for p in printed)
+
+    def test_a_directory_at_the_sarif_path_is_an_input_error(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # unlink() raises on a directory; that must be a reported input error, not a traceback.
+        printed: list[str] = []
+        monkeypatch.setenv("INPUT_TARGET", "https://server.example/mcp")
+        monkeypatch.setenv("INPUT_SARIF_PATH", str(tmp_path))
+        monkeypatch.setenv("INPUT_REPORT_PATH", str(tmp_path / "report.json"))
+        monkeypatch.setattr(action, "run_audit", lambda *a: pytest.fail("the CLI must not run"))
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+        assert action.main() == 1
+        assert any("cannot be replaced" in p for p in printed)
+
+    def test_a_stale_sarif_file_is_removed_before_the_audit(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # The CLI writes the file only after an audit completes; a connection
+        # failure must not leave an earlier step's findings for hashFiles() to upload.
+        stale = tmp_path / "findings.sarif"
+        stale.write_text("{}", encoding="utf-8")
+        monkeypatch.setenv("INPUT_TARGET", "https://server.example/mcp")
+        monkeypatch.setenv("INPUT_SARIF_PATH", str(stale))
+        monkeypatch.setenv("INPUT_REPORT_PATH", str(tmp_path / "report.json"))
+        seen: dict[str, bool] = {}
+
+        def failing_audit(*args):
+            seen["file_gone_before_audit"] = not stale.exists()
+            return 2, "", "connection refused"
+
+        monkeypatch.setattr(action, "run_audit", failing_audit)
+        monkeypatch.setattr("builtins.print", lambda *a, **k: None)
+        assert action.main() == 1
+        assert seen == {"file_gone_before_audit": True}
+        assert not stale.exists()
+
+    def test_an_engine_without_the_flag_names_the_version_needed(self, monkeypatch: pytest.MonkeyPatch):
+        printed: list[str] = []
+        monkeypatch.setenv("INPUT_TARGET", "https://server.example/mcp")
+        monkeypatch.setenv("INPUT_SARIF_PATH", "findings.sarif")
+        monkeypatch.setenv("INPUT_VERSION", "1.13.0")
+        stderr = "usage: mcpscore [-h] ...\nUsage error: unrecognized arguments: --sarif=findings.sarif\n"
+        monkeypatch.setattr(action, "run_audit", lambda *a: (1, "", stderr))
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+        assert action.main() == 1
+        assert any("could not audit" in p for p in printed)
+        assert any(f"needs mcpscore {action.SARIF_MIN_VERSION} or later" in p for p in printed)
+
+    def test_a_stray_option_in_args_is_not_blamed_on_the_engine_version(self, monkeypatch: pytest.MonkeyPatch):
+        # A current engine rejecting `--sariffoo` from `args` is a usage error, not a version problem.
+        printed: list[str] = []
+        monkeypatch.setenv("INPUT_TARGET", "https://server.example/mcp")
+        monkeypatch.setenv("INPUT_SARIF_PATH", "findings.sarif")
+        monkeypatch.setenv("INPUT_ARGS", "--sariffoo")
+        stderr = "Usage error: unrecognized arguments: --sariffoo\n"
+        monkeypatch.setattr(action, "run_audit", lambda *a: (1, "", stderr))
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+        assert action.main() == 1
+        assert any("could not audit" in p for p in printed)
+        assert not any("needs mcpscore" in p for p in printed)
+
+
+class TestPartialConfigBlocks:
+    """The report is another program's output: a thin gate block must not crash the comment."""
+
+    def test_gate_without_fail_on_still_renders(self):
+        report = make_configured_report()
+        report["config"]["gate"] = {"failed": ["a"]}
+
+        body = action.build_report_markdown(report)
+
+        assert "gate at ?" in body
+        assert "**Gate failed:** 1 rule(s) at or above ?: `a`" in body
+        assert action.cli_gate_failures(report, 3) == ["mcpscore [gate] fail_on = ?: failed rule(s) a"]
+
+    def test_gate_without_failed_renders_no_gate_failure(self):
+        report = make_configured_report()
+        report["config"]["gate"] = {"fail_on": "HIGH"}
+
+        assert "Gate failed" not in action.build_report_markdown(report)
+
+
+class TestAuditEnvironment:
+    FAKE_TOKEN = "ghs_not_a_real_token"  # noqa: S105
+    USER_CREDENTIAL = "user-supplied-credential"
+
+    def test_the_comment_token_is_stripped_from_the_audit_subprocess(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("INPUT_GITHUB_TOKEN", self.FAKE_TOKEN)
+        monkeypatch.setenv("MCPSCORE_TOKEN", self.USER_CREDENTIAL)
+        monkeypatch.setenv("INPUT_TARGET", "./server.py")
+        seen: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["env"] = kwargs["env"]
+
+            class Result:
+                returncode = 0
+                stdout = "{}"
+                stderr = ""
+
+            return Result()
+
+        monkeypatch.setattr(action.subprocess, "run", fake_run)
+
+        action.run_audit("./server.py", "", [])
+
+        assert "INPUT_GITHUB_TOKEN" not in seen["env"]
+        assert self.FAKE_TOKEN not in seen["env"].values()
+        # Everything else the step had is still there: the user's own secrets are
+        # theirs to pass, and PATH is what finds uvx.
+        assert seen["env"]["MCPSCORE_TOKEN"] == self.USER_CREDENTIAL
+        assert seen["env"]["INPUT_TARGET"] == "./server.py"
+        assert "PATH" in seen["env"]
+        assert seen["cmd"][:2] == ["uvx", "mcpscore"]
+
+
+@pytest.mark.parametrize("counted", [True, False])
+def test_failure_guidance_includes_readiness_without_changing_gates(counted):
+    report = make_report()
+    report["results"][1].update(message="Missing description", suggested_fix="Describe the tool.")
+    report["readiness"].update(
+        counted_in_main=counted,
+        results=[
+            {
+                "rule_id": "readiness_test",
+                "passed": False,
+                "severity": "HIGH",
+                "message": "Missing version",
+                "suggested_fix": "Publish supportedVersions.",
+            }
+        ],
+    )
+    section = action._failed_rules_section(report)
+    assert "Missing description" in section
+    assert "**Fix:** ` Describe the tool" in section
+    assert "Publish supportedVersions" in section
+    assert ("counted in score" if counted else "informative") in section
+    assert "1 main check(s) failed; 1 readiness check(s) failed" in section
+
+
+def test_repair_text_is_literal_and_old_reports_still_render():
+    report = make_report()
+    assert "**Fix:**" not in action._failed_rules_section(report)
+    report["results"][1]["suggested_fix"] = "<script>alert(1)</script> [click](https://host) @everyone `code`"
+    section = action._failed_rules_section(report)
+    assert "**Fix:** `` <script>alert(1)</script> [click](https://host) @everyone `code` ``" in section
+    report["results"][0]["suggested_fix"] = "Do not show passing advice"
+    assert "Do not show" not in action._failed_rules_section(report)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://localhost/path",
+        "http://localhost:8080/a",
+        "ftp://localhost/file",
+        "user@example.com",
+        "@everyone",
+        "Server's description is missing",
+        "<script>alert(1)</script>",
+        "&lt;script&gt;",
+        'Use "search"',
+    ],
+)
+def test_literal_guidance_uses_a_markdown_code_span(text):
+    assert action._plain_markdown(text) == "` " + text + " `"
+
+
+@pytest.mark.parametrize("text", ["`code`", "`` @everyone ``", "` `` ``` <script> ```"])
+def test_publisher_backticks_cannot_break_out_of_literal_span(text):
+    rendered = action._plain_markdown(text)
+    delimiter, content, closing = (
+        rendered.split(" ", 1)[0],
+        rendered.split(" ", 1)[1].rsplit(" ", 1)[0],
+        rendered.rsplit(" ", 1)[1],
+    )
+    assert delimiter == closing
+    assert set(delimiter) == {"`"}
+    assert delimiter not in text
+    assert content == text
+
+
+@pytest.mark.parametrize("main_failed", [True, False])
+@pytest.mark.parametrize("readiness_failed", [True, False])
+def test_summary_counts_main_and_readiness_failures_separately(main_failed, readiness_failed):
+    report = make_report()
+    report["results"][1]["passed"] = not main_failed
+    report["readiness"]["results"] = [
+        {
+            "rule_id": "readiness_test",
+            "passed": not readiness_failed,
+            "severity": "HIGH",
+        }
+    ]
+    section = action._failed_rules_section(report)
+    if readiness_failed and main_failed:
+        assert "1 main check(s) failed; 1 readiness check(s) failed" in section
+    elif readiness_failed:
+        assert "<summary>1 readiness check(s) failed</summary>" in section
+        assert "0 main" not in section
+    elif main_failed:
+        assert "1 failed check(s)" in section
+    else:
+        assert section == "All checks passed. 🎉"
+
+
+@pytest.mark.parametrize("field", ["message", "suggested_fix"])
+@pytest.mark.parametrize("payload", ["</details><script>alert(1)</script>", "` </details><script>alert(1)</script> ``"])
+def test_publisher_html_cannot_close_the_details_wrapper(field, payload):
+    report = make_report()
+    report["results"][1][field] = payload
+    section = action._failed_rules_section(report)
+    delimiter = "`" * (3 if "``" in payload else 1)
+    literal = delimiter + " " + payload + " " + delimiter
+    assert literal in section
+    outside = section.replace(literal, "LITERAL")
+    assert outside.startswith("<details><summary>")
+    assert outside.endswith("</details>")
+    assert outside.count("<details>") == 1
+    assert outside.count("</details>") == 1
+    assert "<script>" not in outside

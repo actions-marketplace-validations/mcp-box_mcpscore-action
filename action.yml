@@ -15,7 +15,7 @@ inputs:
     required: false
     default: ""
   min-score:
-    description: "Fail the job if the main score percentage (0–100) is below this. Empty = no gate."
+    description: "Fail the job if the main score percentage (0–100) is below this, or if the audit was partial. Empty = no gate."
     required: false
     default: ""
   min-readiness:
@@ -34,6 +34,10 @@ inputs:
     description: "Where to write the JSON report."
     required: false
     default: "mcpscore-report.json"
+  sarif-path:
+    description: "Also write the failed rules as SARIF 2.1.0 to this path, for github/codeql-action/upload-sarif. Empty = off. Needs mcpscore 1.14.0 or later."
+    required: false
+    default: ""
   github-token:
     description: "Token used to post the PR comment. Needs pull-requests: write."
     required: false
@@ -69,12 +73,15 @@ runs:
   using: composite
   steps:
     - name: Install uv
-      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+      uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
     - name: Audit with mcpscore
       id: audit
       shell: bash
       run: python3 "$GITHUB_ACTION_PATH/scripts/mcpscore_action.py"
       env:
+        # A native crash in the CLI (seen twice as a bare exit 139 in CI)
+        # then prints a traceback instead of nothing. Inherited by mcpscore.
+        PYTHONFAULTHANDLER: "1"
         INPUT_TARGET: ${{ inputs.target }}
         INPUT_VERSION: ${{ inputs.version }}
         INPUT_MIN_SCORE: ${{ inputs.min-score }}
@@ -82,4 +89,5 @@ runs:
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_ARGS: ${{ inputs.args }}
         INPUT_REPORT_PATH: ${{ inputs.report-path }}
+        INPUT_SARIF_PATH: ${{ inputs.sarif-path }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
